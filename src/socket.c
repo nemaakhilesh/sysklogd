@@ -39,6 +39,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <net/if.h>	    /* if_nametoindex() */
 #include <netinet/in.h>     /* IN_MULTICAST, IN6_IS_ADDR_MULTICAST */
 #include <sys/stat.h>
 
@@ -142,43 +143,63 @@ skip:	switch (family) {
 	return 0;
 }
 
+static int is_multicast(struct addrinfo *ai)
+{
+	if (ai->ai_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+
+		if (IN_MULTICAST(ntohl(sin->sin_addr.s_addr)))
+			return 1;
+	} else if (ai->ai_family == AF_INET6) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
+
+		if (IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr))
+			return 1;
+	}
+
+	return 0;
+}
+
 /*
  * Check if IP address actually is a multiast group, then join it so
  * the kernel stops blocking the traffic.
  */
-static int join_group(int sd, struct addrinfo *ai)
+static int join_group(int sd, struct addrinfo *ai, char *iface)
 {
-    if (ai->ai_family == AF_INET) {
-        struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+	struct group_req gr = { 0 };
+	unsigned int ifindex = 0;
+	int proto = -1;
 
-        if (IN_MULTICAST(ntohl(sin->sin_addr.s_addr))) {
-            struct ip_mreq mreq;
+	if (!is_multicast(ai))
+		return 0;
 
-            mreq.imr_multiaddr = sin->sin_addr;
-            mreq.imr_interface.s_addr = INADDR_ANY;
+	if (iface && (ifindex = if_nametoindex(iface)) == 0)
+		return -1;
 
-            return setsockopt(sd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq));
-        }
-    } else if (ai->ai_family == AF_INET6) {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
+	gr.gr_interface = ifindex;
+	if (ai->ai_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
 
-        if (IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr)) {
-            struct ipv6_mreq mreq6;
+		proto = IPPROTO_IP;
+		memcpy(&gr.gr_group, sin, sizeof(*sin));
+	} else if (ai->ai_family == AF_INET6) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ai->ai_addr;
 
-            mreq6.ipv6mr_multiaddr = sin6->sin6_addr;
-            mreq6.ipv6mr_interface = 0;
+		proto = IPPROTO_IPV6;
+		memcpy(&gr.gr_group, sin6, sizeof(*sin6));
+	}
 
-            return setsockopt(sd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq6, sizeof(mreq6));
-        }
-    }
+	/* Likely AF_UNIX, or a unicast address, skip join */
+	if (proto == -1)
+		return 0;
 
-    return 0;
+	return setsockopt(sd, proto, MCAST_JOIN_GROUP, &gr, sizeof(gr));
 }
 
 /*
  * create socket, with optional callback for reading inbound data
  */
-int socket_create(struct addrinfo *ai, void (*cb)(int, void *), void *arg)
+int socket_create(struct addrinfo *ai, char *iface, void (*cb)(int, void *), void *arg)
 {
 	struct sockaddr_un *sun = (struct sockaddr_un *)ai->ai_addr;
 	mode_t mode = ai->ai_protocol;
@@ -201,7 +222,7 @@ int socket_create(struct addrinfo *ai, void (*cb)(int, void *), void *arg)
 	if (secure)
 		goto skip;
 
-	if (join_group(sd, ai) < 0)
+	if (join_group(sd, ai, iface) < 0)
 		goto err;
 
 	if (bind(sd, ai->ai_addr, ai->ai_addrlen) < 0)
@@ -245,6 +266,41 @@ int socket_close(int sd)
 	return -1;
 }
 
+/* Set multicast forwarding parameters if fwd address is multicast */
+int socket_mcast(int sd, struct addrinfo *ai, char *iface, int ttl)
+{
+	struct ip_mreqn imr = { 0 };
+	int idx = 0;
+	int rc = 0;
+
+	if (!is_multicast(ai))
+		return 0;
+
+	if (iface) {
+		idx = if_nametoindex(iface);
+		if (idx == 0)
+			return -1;
+	}
+
+	/* Sanity check, also ensures we set a TTL */
+	if (ttl <= 0 || ttl > 255)
+		ttl = 1;
+
+	switch (ai->ai_family) {
+	case AF_INET:
+		imr.imr_ifindex = idx;
+		rc += setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &imr, sizeof(imr));
+		rc += setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+		break;
+	case AF_INET6:
+		rc += setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &idx, sizeof(idx));
+		rc += setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &ttl, sizeof(ttl));
+		break;
+	}
+
+	return rc;
+}
+
 int socket_ffs(int family)
 {
 	struct sock *entry;
@@ -262,7 +318,7 @@ int socket_poll(struct timeval *timeout)
 {
 	int num;
 	fd_set fds;
-	struct sock *entry;
+	struct sock *entry, *tmp;
 
 	FD_ZERO(&fds);
 	LIST_FOREACH(entry, &sl, link)
@@ -277,7 +333,11 @@ int socket_poll(struct timeval *timeout)
 		return num;
 	}
 
-	LIST_FOREACH(entry, &sl, link) {
+	/*
+	 * Use LIST_FOREACH_SAFE because callbacks may close sockets,
+	 * which removes and frees entries from the list.
+	 */
+	LIST_FOREACH_SAFE(entry, &sl, link, tmp) {
 		if (!FD_ISSET(entry->sd, &fds))
 			continue;
 

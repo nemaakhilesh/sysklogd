@@ -3,9 +3,111 @@ Change Log
 
 All relevant changes to the project are documented in this file.
 
-
-[v2.7.0][UNRELEASED]
+[v3.0.0][UNRELEASED] - 2026-06-30
 -----------------------
+
+> [!NOTE]
+> **This is a major release.**  It adds reliable and secure remote logging:
+> TCP ([RFC 6587](https://www.rfc-editor.org/rfc/rfc6587.html)),
+> TLS ([RFC 5425](https://www.rfc-editor.org/rfc/rfc5425.html)), as well as
+> signed messages ([RFC 5848](https://www.rfc-editor.org/rfc/rfc5848.html)).
+>
+> Additional goodies: OpenBSD stop-processing filters, support for printing
+> message priority `<PRI>` in log files, and a BusyBox-style `logread`.
+>
+> **Packagers:** OpenSSL is a new *default build requirement*, because it
+> provides TLS and signed messages.  Use `configure --without-openssl` to build
+> without these features, there's no silent degradation, you must opt out.
+
+### Changes
+
+- Add TCP transport for syslog forwarding per RFC 6587. See the documentation
+  for details on setting up forwarding and reception
+- Add per-destination in-memory send queue for TCP forwarding.  Messages are
+  queued during a receiver outage, up to 1000 entries or 1 MiB per destination,
+  and flushed on reconnect instead of being dropped.  See the documentation
+  for details on the new `tcp_suspend_time SEC` directive
+- Add RFC 5848 signed syslog message support (requires OpenSSL). This provides
+  cryptographic signing of messages for origin authentication, integrity, and
+  replay resistance.  Verification of received signatures is not yet supported
+- Add RFC 5425 TLS transport for remote syslog (requires OpenSSL).  See the
+  documentation for details on setting up forwarding and reception
+- Add `!!prog`, `++host`, and `::filter` stop-processing block prefixes,
+  inspired by OpenBSD.  A double-prefix block stops rule evaluation once a
+  matching rule fires, preventing a message from being logged twice
+- Add `pri` action option, e.g. `*.* /var/log/messages ;pri`, to always print
+  the message priority in the header, in the format in use (RFC3164 or
+  RFC5424).  By Gavin D. Howard.  The NetBSD-style `+` destination prefix is
+  an equivalent alternative, e.g. `*.* +/var/log/messages`, and combines with
+  the `-` no-sync prefix as `+-`
+- Add in-memory log buffer and `logread` tool.  A new `syslog.conf` directive
+  `membuf PATH SIZE [USER:GROUP]` enables a size-bounded ring capturing every
+  message, served to `logread` over a UNIX domain socket
+- Change `:source` property filter to match the peer a message was received
+  from, it used to be an alias for `:hostname`.  Sorts messages by sender even
+  when a sender changes its hostname, see the documentation for an example
+- `logger` now supports TCP transport via `-h`, mirroring the `syslog.conf`
+  forwarding URL syntax, see the documentation for details
+- `logger` new verbose mode, `-V`, prints the resolved peer, transport, and the
+  RFC 6587 framed message (TCP) to stderr, use for verifying remote setups
+- `logger` now parses a leading `<LEVEL>` (PRI) in input messages, e.g.  for
+  systemd-style `daemon --foreground 2>&1 | logger` redirection
+- `logger` message buffer increased from 512 to 2048 bytes, matching `syslogd`,
+  to avoid silent truncation of long messages
+- OpenSSL is now required by default, since it provides the new RFC 5425 TLS
+  and RFC 5848 message signing.  Disable these features using the configure
+  flag `--without-openssl` to actively opt out
+
+### Fixes
+
+- Fix use-after-free in socket polling when callbacks close sockets during
+  iteration.  Could cause undefined behavior when handling multiple concurrent
+  TCP connections
+- Fix #105: UTF-8 handling with the `-8` flag.  Multi-byte sequences, e.g.,
+  em-dash, were corrupted by byte-by-byte sanitization; complete valid UTF-8
+  sequences are now preserved, including the RFC 5424 BOM
+- Unescape Linux `/dev/kmsg` C-style `\xHH` encoding before sanitization, so
+  UTF-8 in kernel messages is preserved with the `-8` flag
+- Fix #104: RFC 3164 tag parsing of parenthesized tags.  Surrounding parens are
+  stripped from complete tags, `(polkit-agent):` becomes `polkit-agent`, while
+  partial tags like `app(version):` are preserved
+
+[v2.7.2][] - 2025-03-31
+-----------------------
+
+### Changes
+- Increased code coverage testing of tag parser
+- Improved error handling in `logger` when invalid arguments to
+  `-p` and `-o` are encountered
+
+### Fixes
+- Fix #102: allow `.` in tag names, regression in v2.7.1
+- Fix various typos in documentation, by Luz Paz
+
+
+[v2.7.1][] - 2025-03-03
+-----------------------
+
+### Changes
+- Update `syslogd -T` documentation, it applies to messages originating
+  both locally and from remote syslog servers, issue #93
+
+### Fixes
+- Fix #99: hostname filtering support, introduced in v2.7.0, broken
+- Fix #100: parsing of userspace messages in `/dev/kmsg` inserted an
+  extra space before the message payload
+
+
+[v2.7.0][] - 2025-01-06
+-----------------------
+
+> [!CAUTION]
+> This release implicitly changes the behavior of forwarded messages.
+> By default, all outbound messages (each has only one syslog line)
+> to remote syslog servers are now capped to 1024 bytes total.
+>
+> See the full log of changes below and the documentation, the program
+> manual pages, for more information.
 
 ### Changes
 - `syslogd` by default now cap forwarded messages to 1024 bytes.  This
@@ -19,10 +121,22 @@ All relevant changes to the project are documented in this file.
   fields: exact match, case-insensitive substring matching or extended
   regular expression
 - Support for remote logging to a multicast group, as well as acting as
-  a multicast group receiver of syslog messages, both IPv4 and IPv6
+  a multicast group receiver of syslog messages, both IPv4 and IPv6.
+  Forwarding to multicast groups support two new, per action, options:
+  - `iface=IFNAME` to set a different outbound interface
+  - `ttl=1.255` to adjust the TTL of outbound multicast (default: 1)
+- Client support for controlling egressing multicast, two new members
+  in `struct syslog_data`: `.log_iface` and `.log_ttl` in libsyslog.a,
+  for details, see above
+- Bump libsyslog.a ABI version: 0.1.0 -> 0.2.0
+- `logger` support for controlling egressing multicast using a new
+  command line option, `-o iface=IFNAME,ttl=<1..255>`
 
 ### Fixes
 - `syslogd` now logs the hostname as the FQDN in RFC5424 output format
+- Fix #90 (reopened): parsing of IPv6 addresses in `listen` .conf file
+  directive, as well as the command line option `-b`, is broken.  The
+  format `-b [A:B:C:D]:PORT` is now correctly parsed
 
 
 [v2.6.2][] - 2024-09-08
@@ -475,7 +589,7 @@ and a replacement for `syslog.h` to enable new features in RFC5424.
 - New `syslogp()` API from NetBSD, for applications wanting to use
   RFC5424 features like MsgID or structured data
 - Many *incompatible changes* to command line options in `syslogd` and
-  `klogd` for compatiblity with FreeBSD and NetBSD syslogd.  Examples:
+  `klogd` for compatibility with FreeBSD and NetBSD syslogd.  Examples:
   - In syslogd: `-b` and `-c` have been replaced with `-r` for global
     log rotation, `-a` has been replaced with the new `-p` support.  The
     `-r` flag and `-s HOST` has also been dropped in favor of the BSD
@@ -646,7 +760,10 @@ and a replacement for `syslog.h` to enable new features in RFC5424.
 - Several bugfixes and improvements, please refer to the .c files
 
 
-[UNRELEASED]: https://github.com/troglobit/sysklogd/compare/v2.6.2...HEAD
+[UNRELEASED]: https://github.com/troglobit/sysklogd/compare/v2.7.2...HEAD
+[v2.7.2]:     https://github.com/troglobit/sysklogd/compare/v2.7.1...v2.7.2
+[v2.7.1]:     https://github.com/troglobit/sysklogd/compare/v2.7.0...v2.7.1
+[v2.7.0]:     https://github.com/troglobit/sysklogd/compare/v2.6.2...v2.7.0
 [v2.6.2]:     https://github.com/troglobit/sysklogd/compare/v2.6.1...v2.6.2
 [v2.6.1]:     https://github.com/troglobit/sysklogd/compare/v2.6.0...v2.6.1
 [v2.6.0]:     https://github.com/troglobit/sysklogd/compare/v2.5.2...v2.6.0

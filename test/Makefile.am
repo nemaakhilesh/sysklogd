@@ -1,11 +1,17 @@
 EXTRA_DIST       = lib.sh opts.sh
 EXTRA_DIST      += api.sh local.sh unicode.sh remote.sh fwd.sh mark.sh      \
 		   memleak.sh facility.sh notify.sh rotate_all.sh secure.sh \
-		   logger.sh listen.sh sighup.sh tag.sh hostname.sh 	    \
-                   property.sh raw.sh regression.sh multicast.sh mcast-fwd.sh
+		   logger.sh listen.sh sighup.sh tag.sh hostname.sh	    \
+		   property.sh raw.sh regression.sh multicast.sh	    \
+		   mcast-fwd.sh mcast-iface.sh parens.sh tcp-fwd.sh sign.sh \
+		   tls-fwd.sh stop.sh tcp-queue.sh
+EXTRA_DIST      += pri.sh
+EXTRA_DIST      += loglevel.sh
+EXTRA_DIST      += tls-auth.sh
+EXTRA_DIST      += logread.sh
 CLEANFILES       = *~ *.trs *.log
 TEST_EXTENSIONS  = .sh
-TESTS_ENVIRONMENT= unshare -mrun
+TESTS_ENVIRONMENT= unshare -mrun --map-auto
 
 check_PROGRAMS   = api
 api_SOURCES      = api.c
@@ -29,11 +35,27 @@ TESTS           += rotate_all.sh
 TESTS           += secure.sh
 TESTS           += sighup.sh
 TESTS           += tag.sh
+TESTS           += parens.sh
 TESTS           += hostname.sh
 TESTS           += property.sh
+TESTS           += source.sh
 TESTS           += raw.sh
 TESTS           += regression.sh
 TESTS           += multicast.sh
 TESTS           += mcast-fwd.sh
+TESTS           += mcast-iface.sh
+TESTS           += tcp-fwd.sh
+TESTS           += tcp-queue.sh
+TESTS           += stop.sh
+TESTS           += pri.sh
+TESTS           += loglevel.sh
+if ENABLE_LOGREAD
+TESTS           += logread.sh
+endif
+if ENABLE_SSL
+TESTS           += sign.sh
+TESTS           += tls-fwd.sh
+TESTS           += tls-auth.sh
+endif
 
 programs: $(check_PROGRAMS)

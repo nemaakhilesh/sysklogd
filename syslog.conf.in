@@ -7,7 +7,14 @@
 # First some standard log files.  Log by facility.
 #
 auth,authpriv.*			 /var/log/auth.log
-*.*;auth,authpriv.none		-/var/log/syslog
+
+#
+# Include all config files in /etc/syslog.d/ before the catch-all rules
+# below.  This allows snippets to use stop-processing block prefixes
+# (!!, ++, ::) to capture messages exclusively, preventing them from
+# also being matched by the general rules that follow.
+#
+include /etc/syslog.d/*.conf
 
 #cron.*				/var/log/cron.log
 #daemon.*			-/var/log/daemon.log
@@ -15,6 +22,8 @@ kern.*				-/var/log/kern.log
 #lpr.*				-/var/log/lpr.log
 mail.*				-/var/log/mail.log
 #user.*				-/var/log/user.log
+
+*.*;auth,authpriv.none		-/var/log/syslog
 
 #
 # Logging for the mail system.  Split it up so that
@@ -44,7 +53,7 @@ mail.err			 /var/log/mail.err
 
 #
 # Store all critical events, except kernel logs, in critical RFC5424 format.
-# Overide global log rotation settings, rotate every 10MiB, keep 5 old logs,
+# Override global log rotation settings, rotate every 10MiB, keep 5 old logs,
 #
 #*.=crit;kern.none		/var/log/critical	;rotate=10M:5,RFC5424
 
@@ -68,7 +77,7 @@ mail.err			 /var/log/mail.err
 # Secure mode, same as -s, none(0), on(1), full(2).  When enabled
 # only logging to remote syslog server possible, with full secure
 # mode, not even that is possible.  We default to prevent syslogd
-# from opening UDP/514 and receving messages from other systems.
+# from opening UDP/514 and receiving messages from other systems.
 #
 secure_mode 1
 
@@ -77,8 +86,4 @@ secure_mode 1
 #
 #rotate_size  1M
 #rotate_count 5
-
-#
-# Include all config files in /etc/syslog.d/
-#
-include /etc/syslog.d/*.conf
+@MEMBUF_EXAMPLE@

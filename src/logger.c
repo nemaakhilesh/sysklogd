@@ -39,14 +39,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
 #define SYSLOG_NAMES
 #include "compat.h"
 #include "syslog.h"
+
+#ifndef MAXLINE
+#define MAXLINE 2048		/* keep in sync with syslogd's MAXLINE */
+#endif
 
 static const char version_info[] = PACKAGE_NAME " v" PACKAGE_VERSION;
 static struct syslog_data log    = SYSLOG_DATA_INIT;
@@ -97,15 +103,18 @@ static int logrotate(char *file, int num, off_t sz)
 					char cmd[len];
 
 					snprintf(cmd, len, "gzip %s", nfile);
-					system(cmd);
+					if (system(cmd)) {
+						/* best effort compression */
+					}
 
 					remove(nfile);
 				}
 			}
 
-			if (rename(file, nfile))
-				(void)truncate(file, 0);
-			else
+			if (rename(file, nfile)) {
+				if (truncate(file, 0))
+					syslog(LOG_ERR | LOG_PERROR, "Failed truncating %s during logrotate: %s", file, strerror(errno));
+			} else
 				create(file, st.st_mode, st.st_uid, st.st_gid);
 		} else {
 			if (truncate(file, 0))
@@ -125,7 +134,58 @@ static void log_kmsg(FILE *fp, char *ident, int pri, int opts, char *buf)
 	fprintf(fp, "<%d>%s[%d]:%s\n", pri, ident, getpid(), buf);
 }
 
-static int nslookup(const char *host, const char *svcname, int family, struct sockaddr *sa)
+/*
+ * Parse optional transport://[host]:port URL in the -h argument.
+ * Detects tcp://, udp://, tls:// prefixes and an optional embedded :port.
+ * IPv6 addresses must use bracket notation: tcp://[::1]:514
+ * Returns 1 if TCP transport requested, 0 for UDP (default).
+ * Updates *hostp and, if a port is embedded in the URL, *svcnamep.
+ */
+static int parse_url(const char *arg, const char **hostp, const char **svcnamep)
+{
+	static char buf[NI_MAXHOST + 16];
+	char *h, *port = NULL;
+	int tcp = 0;
+
+	strlcpy(buf, arg, sizeof(buf));
+	h = buf;
+
+	if (!strncmp(h, "udp://", 6))
+		h += 6;
+	else if (!strncmp(h, "tcp://", 6)) {
+		h += 6;
+		tcp = 1;
+	} else if (!strncmp(h, "tls://", 6))
+		errx(1, "TLS transport not yet supported in logger");
+
+	/* Extract port: [IPv6]:port or host:port */
+	if (*h == '[') {
+		char *end = strchr(h + 1, ']');
+
+		if (end) {
+			*end = '\0';
+			h++;
+			if (*(end + 1) == ':')
+				port = end + 2;
+		}
+	} else {
+		char *colon = strrchr(h, ':');
+
+		if (colon) {
+			*colon = '\0';
+			port = colon + 1;
+		}
+	}
+
+	*hostp = h;
+	if (port)
+		*svcnamep = port;
+
+	return tcp;
+}
+
+static int nslookup(const char *host, const char *svcname, int family, int socktype,
+		    struct sockaddr_storage *sa, socklen_t *addrlen)
 {
 	struct addrinfo hints, *ai, *result;
 	int error;
@@ -133,11 +193,11 @@ static int nslookup(const char *host, const char *svcname, int family, struct so
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_flags    = !host ? AI_PASSIVE : 0;
 	hints.ai_family   = family;
-	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_socktype = socktype;
 
 	error = getaddrinfo(host, svcname, &hints, &result);
 	if (error == EAI_SERVICE) {
-		warnx("%s/udp: unknown service, trying syslog port 514", svcname);
+		warnx("%s: unknown service, trying syslog port 514", svcname);
 		svcname = "514";
 		error = getaddrinfo(host, svcname, &hints, &result);
 	}
@@ -151,9 +211,110 @@ static int nslookup(const char *host, const char *svcname, int family, struct so
 			continue;
 
 		memcpy(sa, ai->ai_addr, ai->ai_addrlen);
+		*addrlen = ai->ai_addrlen;
 		break;
 	}
 	freeaddrinfo(result);
+
+	return 0;
+}
+
+static void print_peer(const struct sockaddr_storage *sa, socklen_t addrlen,
+		       const char *transport)
+{
+	char host[NI_MAXHOST], port[NI_MAXSERV];
+
+	if (getnameinfo((const struct sockaddr *)sa, addrlen,
+			host, sizeof(host), port, sizeof(port),
+			NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+		fprintf(stderr, "%s port %s (%s)", host, port, transport);
+	else
+		fprintf(stderr, "(unknown) (%s)", transport);
+}
+
+static int tcp_connect(struct sockaddr_storage *sa, socklen_t addrlen)
+{
+	int sock;
+
+	sock = socket(sa->ss_family, SOCK_STREAM, 0);
+	if (sock < 0) {
+		warn("socket");
+		return -1;
+	}
+
+	if (connect(sock, (struct sockaddr *)sa, addrlen) < 0) {
+		warn("connect");
+		close(sock);
+		return -1;
+	}
+
+	return sock;
+}
+
+/*
+ * Format and send one syslog message over an open TCP socket.
+ * Uses RFC 6587 octet-count framing to match syslogd's TCP send path.
+ */
+static int tcp_send(int sock, int pri, const char *hostname, const char *tag,
+		    int pid, int log_opts, const char *msgid, const char *sd_data,
+		    const char *msg, int verbose)
+{
+	char mbuf[MAXLINE];
+	char frame[16];
+	struct timeval tv;
+	struct tm tm;
+	int mlen, flen;
+
+	if (!tag)
+		tag = getprogname();
+	if (!tag)
+		tag = "-";
+
+	gettimeofday(&tv, NULL);
+	localtime_r(&tv.tv_sec, &tm);
+
+	if (log_opts & LOG_RFC3164) {
+		char ts[16];
+
+		strftime(ts, sizeof(ts), "%b %e %T", &tm);
+		if (log_opts & LOG_PID)
+			mlen = snprintf(mbuf, sizeof(mbuf), "<%d>%s %s %s[%d]: %s",
+					pri, ts, hostname, tag, pid, msg);
+		else
+			mlen = snprintf(mbuf, sizeof(mbuf), "<%d>%s %s %s: %s",
+					pri, ts, hostname, tag, msg);
+	} else {
+		char ts[33], tz[7] = "Z", tzraw[6], pidstr[16];
+
+		strftime(ts, sizeof(ts), "%FT%T", &tm);
+		if (strftime(tzraw, sizeof(tzraw), "%z", &tm) == 5)
+			snprintf(tz, sizeof(tz), "%c%c%c:%c%c",
+				 tzraw[0], tzraw[1], tzraw[2], tzraw[3], tzraw[4]);
+
+		if (log_opts & LOG_PID)
+			snprintf(pidstr, sizeof(pidstr), "%d", pid);
+		else
+			strlcpy(pidstr, "-", sizeof(pidstr));
+
+		mlen = snprintf(mbuf, sizeof(mbuf),
+				"<%d>1 %s.%06ld%s %s %s %s %s %s %s",
+				pri, ts, (long)tv.tv_usec, tz,
+				hostname, tag, pidstr,
+				msgid   ? msgid   : "-",
+				sd_data ? sd_data : "-",
+				msg);
+	}
+
+	if (verbose)
+		fprintf(stderr, "sending (%d bytes): %.*s\n", mlen, mlen, mbuf);
+
+	/* RFC 6587 octet-count framing: "LEN SP MSG" (two sends, no newline) */
+	flen = snprintf(frame, sizeof(frame), "%d ", mlen);
+	if (send(sock, frame, flen, MSG_NOSIGNAL) <= 0 ||
+	    send(sock, mbuf, mlen, MSG_NOSIGNAL) <= 0) {
+		warn("send");
+		return 1;
+	}
 
 	return 0;
 }
@@ -179,18 +340,50 @@ static int checksz(FILE *fp, off_t sz)
 
 static char *chomp(char *str)
 {
-        char *p;
+	char *p;
 
-        if (!str || strlen(str) < 1) {
-                errno = EINVAL;
-                return NULL;
-        }
+	if (!str || strlen(str) < 1) {
+		errno = EINVAL;
+		return NULL;
+	}
 
-        p = str + strlen(str) - 1;
-        while (p >= str && *p == '\n')
-                *p-- = 0;
+	p = str + strlen(str) - 1;
+	while (p >= str && *p == '\n')
+		*p-- = 0;
 
-        return str;
+	return str;
+}
+
+/*
+ * Parse possible systemd style log <level> prefix from message
+ * For details, see libsystemd/sd-daemon.h
+ *
+ * Returns the level, and updates buf to point past the prefix
+ */
+static int parse_level(char **buf, int severity)
+{
+	char *msg = *buf;
+
+	if (msg[0] == '<' && msg[2] == '>' && msg[1] >= '0' && msg[1] <= '7') {
+		int level;
+
+		switch (msg[1]) {
+		case '0': level = LOG_EMERG;    break;
+		case '1': level = LOG_ALERT;    break;
+		case '2': level = LOG_CRIT;     break;
+		case '3': level = LOG_ERR;      break;
+		case '4': level = LOG_WARNING;  break;
+		case '5': level = LOG_NOTICE;   break;
+		case '6': level = LOG_INFO;     break;
+		case '7': level = LOG_DEBUG;    break;
+		default:  level = severity;     break;
+		}
+
+		*buf = msg + 3;
+		return (severity & ~LOG_PRIMASK) | level;
+	}
+
+	return severity;
 }
 
 static int parse_prio(const char *arg, int *f, int *l)
@@ -235,6 +428,42 @@ static int parse_prio(const char *arg, int *f, int *l)
 	return 0;
 }
 
+static int parse_opts(char *arg, char **iface, int *ttl)
+{
+	char *subopts = arg;
+	char *value;
+	enum {
+		IFACE_OPT = 0,
+		TTL_OPT,
+	};
+	char *const token[] = {
+		[IFACE_OPT] = "iface",
+		[TTL_OPT]   = "ttl",
+		NULL
+	};
+
+	while (*subopts != '\0') {
+		switch (getsubopt(&subopts, token, &value)) {
+		case IFACE_OPT:
+			if (!value)
+				return 1;
+			*iface = value;
+			break;
+		case TTL_OPT:
+			if (!value)
+				return 1;
+			*ttl = atoi(value);
+			if (*ttl < 1 || *ttl > 255)
+				return 1;
+			break;
+		default:
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
 static int usage(int code)
 {
 	printf("Usage: logger [OPTIONS] [MESSAGE]\n"
@@ -247,21 +476,29 @@ static int usage(int code)
 	       "  -c        Log to console (LOG_CONS) on failure\n"
 	       "  -d SD     Log SD as RFC5424 style 'structured data' in message\n"
 	       "  -f FILE   Log file to write messages to, instead of syslog daemon\n"
-	       "  -h HOST   Send (UDP) message to this remote syslog server (IP or DNS name)\n"
+	       "  -h HOST   Send message to remote syslog server; HOST may be prefixed with\n"
+	       "            udp:// (default), or tcp:// to select the transport.\n"
+	       "            An optional port may be embedded: tcp://HOST:PORT\n"
+	       "            IPv6 addresses require bracket notation: tcp://[::1]:514\n"
 	       "  -H NAME   Use NAME instead of system hostname in message header\n"
 	       "  -i        Log process ID of the logger process with each line (LOG_PID)\n"
-	       "  -I PID    Log process ID using PID, recommed using PID $$ for shell scripts\n"
+	       "  -I PID    Log process ID using PID, recommend using PID $$ for shell scripts\n"
 #ifdef __linux__
 	       "  -k        Log to kernel /dev/kmsg if /dev/log doesn't exist yet\n"
 #endif
 	       "  -m MSGID  Log message using this RFC5424 style MSGID\n"
 	       "  -n        Open log file immediately (LOG_NDELAY)\n"
+	       "  -o OPT    Set outbound multicast options:\n"
+	       "                iface=IFNAME\n"
+	       "                ttl=1-255\n"
 	       "  -p PRIO   Log message priority (numeric or facility.severity pair)\n"
 	       "  -P PORT   Use PORT (or named UDP service) for remote server, default: syslog\n"
 	       "  -r S[:R]  Enable log file rotation, default: 200 kB \e[4ms\e[0mize, 5 \e[4mr\e[0motations\n"
 	       "  -s        Log to stderr as well as the system log\n"
 	       "  -t TAG    Log using the specified tag (defaults to user name)\n"
 	       "  -u SOCK   Log to UNIX domain socket `SOCK` instead of default %s\n"
+	       "  -V        Verbose: print resolved peer and message to stderr, useful\n"
+	       "            for verifying syslogd setups when used with -h\n"
 	       "  -?        This help text\n"
 	       "  -v        Show program version\n"
 	       "\n"
@@ -276,22 +513,27 @@ static int usage(int code)
 int main(int argc, char *argv[])
 {
 	char *ident = NULL, *logfile = NULL;
-	char *host = NULL, *sockpath = NULL;
+	const char *host = NULL, *svcname = "syslog";
+	char *sockpath = NULL;
 	char *msgid = NULL, *sd = NULL;
-	char *svcname = "syslog";
+	struct sockaddr_storage sa;
+	socklen_t addrlen = 0;
 	off_t size = 200 * 1024;
 	int facility = LOG_USER;
 	int severity = LOG_NOTICE;
 	int family = AF_UNSPEC;
-	struct sockaddr sa;
 	int allow_kmsg = 0;
-	char buf[512] = "";
+	int use_tcp = 0;
+	int verbose = 0;
+	char buf[MAXLINE] = "";
+	char *iface = NULL;
 	int log_opts = 0;
 	FILE *fp = NULL;
 	int c, num = 5;
 	int rotate = 0;
+	int ttl = 1;
 
-	while ((c = getopt(argc, argv, "46?bcd:f:h:H:iI:km:np:P:r:st:u:v")) != EOF) {
+	while ((c = getopt(argc, argv, "46?bcd:f:h:H:iI:km:no:p:P:r:st:u:Vv")) != EOF) {
 		switch (c) {
 		case '4':
 			family = AF_INET;
@@ -318,7 +560,7 @@ int main(int argc, char *argv[])
 			break;
 
 		case 'h':
-			host = optarg;
+			use_tcp = parse_url(optarg, &host, &svcname);
 			break;
 
 		case 'H':
@@ -351,9 +593,18 @@ int main(int argc, char *argv[])
 			log_opts |= LOG_NDELAY;
 			break;
 
-		case 'p':
-			if (parse_prio(optarg, &facility, &severity))
+		case 'o':
+			if (parse_opts(optarg, &iface, &ttl)) {
+				printf("Invalid option argument '-%c %s'\n", c, optarg);
 				return usage(1);
+			}
+			break;
+
+		case 'p':
+			if (parse_prio(optarg, &facility, &severity)) {
+				printf("Invalid option argument '-%c %s'\n", c, optarg);
+				return usage(1);
+			}
 			break;
 
 		case 'P':
@@ -378,12 +629,20 @@ int main(int argc, char *argv[])
 			sockpath = optarg;
 			break;
 
+		case 'V':
+			verbose = 1;
+			break;
+
 		case 'v':	/* version */
 			printf("%s\n", version_info);
 			return 0;
 
-		default:
+		case '?':
 			return usage(0);
+
+		default:
+			printf("Unsupported option '-%c'\n", c);
+			return usage(1);
 		}
 	}
 
@@ -439,18 +698,76 @@ int main(int argc, char *argv[])
 
 			return fclose(fp);
 		}
-	} else if (host) {
-		log.log_host = &sa;
-		if (nslookup(host, svcname, family, &sa))
+	} else if (host && !use_tcp) {
+		log.log_host  = &sa;
+		log.log_iface = iface;
+		log.log_ttl   = ttl;
+		if (nslookup(host, svcname, family, SOCK_DGRAM, &sa, &addrlen))
 			return 1;
+		if (verbose) {
+			fprintf(stderr, "sending to ");
+			print_peer(&sa, addrlen, "udp");
+			fprintf(stderr, "\n");
+		}
 		log_opts |= LOG_NDELAY;
+	}
+
+	if (use_tcp) {
+		char hostname[NI_MAXHOST];
+		int sock, pid_val, rc = 0;
+
+		if (log.log_hostname[0])
+			strlcpy(hostname, log.log_hostname, sizeof(hostname));
+		else if (gethostname(hostname, sizeof(hostname)) < 0)
+			strlcpy(hostname, "-", sizeof(hostname));
+
+		pid_val = (log.log_pid != -1) ? log.log_pid : getpid();
+
+		if (nslookup(host, svcname, family, SOCK_STREAM, &sa, &addrlen))
+			return 1;
+
+		if (verbose) {
+			fprintf(stderr, "connecting to ");
+			print_peer(&sa, addrlen, "tcp");
+			fprintf(stderr, " ... ");
+		}
+
+		sock = tcp_connect(&sa, addrlen);
+		if (verbose)
+			fprintf(stderr, sock < 0 ? "failed\n" : "connected\n");
+		if (sock < 0)
+			return 1;
+
+		if (!buf[0]) {
+			while (fgets(buf, sizeof(buf), stdin)) {
+				char *msg = chomp(buf);
+				int level = parse_level(&msg, facility | severity);
+
+				if (tcp_send(sock, level, hostname, ident,
+					     pid_val, log_opts, msgid, sd, msg, verbose)) {
+					rc = 1;
+					break;
+				}
+			}
+		} else {
+			rc = tcp_send(sock, facility | severity, hostname, ident,
+				      pid_val, log_opts, msgid, sd, buf, verbose);
+		}
+
+		close(sock);
+		return rc;
 	}
 
 	openlog_r(ident, log_opts, facility, &log);
 
 	if (!buf[0]) {
-		while ((fgets(buf, sizeof(buf), stdin)))
-			syslogp_r(severity, &log, msgid, sd, "%s", chomp(buf));
+		while ((fgets(buf, sizeof(buf), stdin))) {
+			char *msg = chomp(buf);
+			int level;
+
+			level = parse_level(&msg, severity);
+			syslogp_r(level, &log, msgid, sd, "%s", msg);
+		}
 	} else
 		syslogp_r(severity, &log, msgid, sd, "%s", buf);
 

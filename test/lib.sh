@@ -113,7 +113,7 @@ cap_start()
 	iface=lo
     fi
     port=${1:-514}
-    # dprint "tshark -Qni $iface -w ${CAP} port $port"
+
     tshark -Qni "$iface" -w "${CAP}" port "$port" 2>/dev/null &
     TPID="$!"
     echo "$TPID" >> "$DIR/PIDs"
@@ -127,11 +127,15 @@ cap_stop()
     wait "${TPID}"
 }
 
+# Optional port argument to remap for syslog dissector
 cap_dump()
 {
-    # command -v tcpdump >/dev/null 2>&1 || SKIP 'tcpdump missing'
-    # tcpdump -Z root -nr "${CAP}" -vvv 2>/dev/null
-    tshark -r "${CAP}" 2>/dev/null
+    if [ $# -gt 0 ]; then
+	data="-d udp.port==$1,syslog"
+    fi
+
+    # shellcheck disable=SC2086
+    tshark -r "${CAP}" $data -o 'gui.column.format:"N:o","%m","TTL","%Cus:ip.ttl","Source","%us","Destination","%ud","src port","%S","dst port","%D","Info","%i"' 2>/dev/null
 }
 
 cap_find()
@@ -139,17 +143,25 @@ cap_find()
     cap_dump | grep "$@"
 }
 
+# Remap traffic on port to syslog
+cap_find_port()
+{
+    port=$1; shift
+    cap_dump "$port" | grep "$@"
+}
+
 logger()
 {
     [ -x ../src/logger ] || SKIP 'logger missing'
 
-    sock="${SOCK}"
-    if [ $# -gt 1 ] && [ -f "$1" ]; then
+    if [ $# -gt 1 ] && [ -S "$1" ]; then
 	sock="$1"
 	shift
+    elif [ $# -eq 1 ]; then
+	sock="${SOCK}"
     fi
 
-    if [ -f "$sock" ]; then
+    if [ -S "$sock" ]; then
 	../src/logger -u "$sock" "$@"
     else
 	../src/logger "$@"
@@ -162,7 +174,10 @@ log_and_find()
     message="$*"
 
     logger "${altsock}" "$message"
-    grep   "$message"   "$LOG"
+
+    # syslogd drains the socket asynchronously, so the line may not be
+    # in $LOG the instant logger returns -- retry instead of grep once.
+    tenacious 5 grep "$message" "$LOG"
 }
 
 # Helper to poll for a file with a timeout
@@ -184,7 +199,7 @@ poll()
     return 0
 }
 
-# shellcheck disable=SC2046,SC2086
+# shellcheck disable=SC2002
 do_setup()
 {
     order=$1
@@ -208,12 +223,13 @@ do_setup()
     if ! poll "${pidfn}"; then
         FAIL "Failed starting $order syslogd"
     fi
-    cat "${pidfn}" >> "$DIR/PIDs"
+    pid=$(cat "${pidfn}" | tee -a "$DIR/PIDs")
+    dprint "Started as PID $pid"
 
     # Enable debugging ...
     if [ -z "$VALGRIND" ]; then
-	dprint "Enabling debugging USR1 ..."
-	kill -USR1 $(cat "${pidfn}")
+	dprint "Enabling debugging, sending USR1 to $pid ..."
+	kill -USR1 "$pid"
     fi
 }
 

@@ -45,6 +45,8 @@ __RCSID("$NetBSD: syslog.c,v 1.55 2015/10/26 11:44:30 roy Exp $");
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <netdb.h>
+#include <net/if.h>	    /* if_nametoindex() */
+#include <netinet/in.h>     /* IN_MULTICAST, IN6_IS_ADDR_MULTICAST */
 
 #include <errno.h>
 #include <fcntl.h>
@@ -109,6 +111,42 @@ static socklen_t sa_len(struct sockaddr *sa)
 	return 0;
 }
 #endif
+
+/*
+ * Used to set outbound multicast interface and IP TTL
+ */
+static int set_mcopts(int sd, struct sockaddr *sa, char *iface, int ttl)
+{
+	int idx = 0;
+	int rc = 0;
+
+	if (iface) {
+		idx = if_nametoindex(iface);
+		if (idx == 0)
+			return -1;
+	}
+
+	if (sa->sa_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)sa;
+		struct ip_mreqn imr = { .imr_ifindex = idx };
+
+		if (!IN_MULTICAST(ntohl(sin->sin_addr.s_addr)))
+			return 0;
+
+		rc += setsockopt(sd, IPPROTO_IP, IP_MULTICAST_IF, &imr, sizeof(imr));
+		rc += setsockopt(sd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
+	} else if (sa->sa_family == AF_INET6) {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)sa;
+
+		if (!IN6_IS_ADDR_MULTICAST(&sin6->sin6_addr))
+			return 0;
+
+		rc += setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &idx, sizeof(idx));
+		rc += setsockopt(sd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &ttl, sizeof(ttl));
+	}
+
+	return rc;
+}
 
 /*
  * syslog, vsyslog --
@@ -422,9 +460,20 @@ vsyslogp_r(int pri, struct syslog_data *data, const char *msgid,
 		strlcat(fmt_cat, "-", FMT_LEN);
 
 output:
-	if (data->log_stat & (LOG_PERROR|LOG_CONS|LOG_NLOG))
-		msgsdlen = strlen(fmt_cat) + 1;
-	else
+	if (data->log_stat & (LOG_PERROR|LOG_CONS|LOG_NLOG)) {
+		va_list ap2;
+		int pfxlen;
+
+		/*
+		 * Length of the "MSGID SD " prefix the PERROR/CONS echo skips.
+		 * Measure the expanded prefix, not the format string, since the
+		 * SD may contain conversions; +1 for the space before the msg.
+		 */
+		va_copy(ap2, ap);
+		pfxlen = vsnprintf(NULL, 0, fmt_cat, ap2);
+		va_end(ap2);
+		msgsdlen = (pfxlen < 0 ? strlen(fmt_cat) : (size_t)pfxlen) + 1;
+	} else
 		msgsdlen = 0;	/* XXX: GCC */
 
 	if (msgfmt != NULL && *msgfmt != '\0') {
@@ -488,14 +537,18 @@ output:
 			piov = iov;
 			piovcnt = iovcnt + 1;
 		}
-		(void)writev(STDERR_FILENO, piov, piovcnt + 1);
+		if (writev(STDERR_FILENO, piov, piovcnt) < 0) {
+			/* best effort echo to stderr */
+		}
 	}
 
 	/* Don't write to system log, instead use fd in log_file */
 	if (data->log_stat & LOG_NLOG) {
 		iov[iovcnt].iov_base = __UNCONST(CRLF + 1);
 		iov[iovcnt].iov_len = 1;
-		(void)writev(data->log_file, iov, iovcnt + 1);
+		if (writev(data->log_file, iov, iovcnt + 1) < 0) {
+			/* best effort */
+		}
 		goto done;
 	}
 
@@ -510,7 +563,9 @@ output:
 	/* Log to stdout, usually for debugging syslogp() API */
 	if (data->log_stat & LOG_STDOUT) {
 		strlcat(tbuf, "\n", sizeof(tbuf));
-		write(data->log_file, tbuf, strlen(tbuf));
+		if (write(data->log_file, tbuf, strlen(tbuf)) < 0) {
+			/* best effort */
+		}
 		goto done;
 	}
 
@@ -534,6 +589,7 @@ output:
 	for (tries = 0; tries < MAXTRIES; tries++) {
 		if (sendto(data->log_file, tbuf, cnt, 0, sa, len) != -1)
 			break;
+
 		if (errno != ENOBUFS) {
 			disconnectlog_r(data);
 			connectlog_r(data);
@@ -551,7 +607,9 @@ output:
 		O_WRONLY | O_NONBLOCK | O_CLOEXEC, 0)) >= 0) {
 		iov[iovcnt].iov_base = __UNCONST(CRLF);
 		iov[iovcnt].iov_len = 2;
-		(void)writev(fd, iov, iovcnt + 1);
+		if (writev(fd, iov, iovcnt + 1) < 0) {
+			/* best effort console fallback */
+		}
 		(void)close(fd);
 	}
 
@@ -633,6 +691,9 @@ connectlog_r(struct syslog_data *data)
 			data->log_connected = 1;
 			return;
 		}
+
+		/* attempt to set outbound interface for multicast & ttl */
+		set_mcopts(data->log_file, sa, data->log_iface, data->log_ttl);
 
 		if (connect(data->log_file, sa, len) == -1) {
 			(void)close(data->log_file);

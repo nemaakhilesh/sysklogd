@@ -41,7 +41,7 @@
 .Op Fl ?468AcdFHKklnsTtv
 .Op Fl a Ar addr[/len][:port]
 .Op Fl a Ar name[:port]
-.Op Fl b Ar addr[:port]
+.Op Fl b Ar addr[:port][%iface]
 .Op Fl b Ar :port
 .Op Fl C Ar file
 .Op Fl f Ar file
@@ -205,30 +205,33 @@ is as explained above.
 can contain special characters of a shell-style pattern such as
 .Ql * .
 .El
-.It Fl b Ar name
-Bind to a specific address and/or port.  By default,
+.It Fl b Ar addr[:port][%iface]
+Bind to, or listen to, a specific address and/or port.  By default,
 .Nm
-listens on all interfaces on UDP port 514, unless started with the
-.Fl s
-option.  Multiple
+listens to UDP port 514 on all interfaces, unless started in secure
+.Fl ( s )
+mode.  Multiple
 .Fl b
 options may be specified to bind to several addresses and/or ports.
 .Pp
-The
-.Ar name
-argument may be any of the following:
-.Bl -tag -width 'address[:port]' -offset indent
+.Bl -tag -width 'group[:port][%iface]' -offset indent
 .It address[:port]
-Hostname or an IP address, with the port as a service name, see
-.Xr services 5 ,
-or port number.  An IPv6 address should be enclosed with
+Hostname or IP address, IPv6 addresses should be enclosed in
 .Ql \&[
 and
 .Ql \&]
+.It group[:port][%iface]
+Join the given multicast group on the optional inbound interface.
+If
+.Ql %iface
+is omitted, the kernel will rely on the routing table to determine which
+interface to listen to, which is usually not what you want
 .It :port
-Service name or UDP port number.  The default service is
+Service name or UDP port number, see
+.Xr services 5 .
+The default service is
 .Ql syslog
-(UDP), port 512
+(UDP/514)
 .El
 .Pp
 Both unicast IP and multicast group addresses are supported.  Multicast
@@ -408,10 +411,13 @@ the command line option always wins, so it must be removed for
 .Nm
 to consider the .conf file option instead.
 .It Fl T
-Always use the local time and date for messages received from the network,
-instead of the timestamp field supplied in the message by the remote host.
-This is useful if some of the originating hosts cannot keep time properly
-or are unable to generate a correct timestamp.
+Always use the local time and date for messages instead of the timestamp
+field in the log message.  This applies to both messages received from a
+remote syslog server and locally originated.  Useful if the originating
+hosts cannot keep time properly or are unable to generate a correct
+timestamp.  See
+.Fl t
+for details on the timestamp of (local) kernel messages.
 .It Fl t
 Keep (trust) kernel timestamp.
 .Pp
@@ -436,8 +442,17 @@ Show program version and exit.
 .Pp
 The
 .Nm
-utility reads its configuration file when it starts up and whenever it
-receives a hangup signal.
+utility reads its configuration file at startup and whenever it receives
+.Dv SIGHUP .
+To apply changes to
+.Xr syslog.conf 5
+without restarting, run
+.Ql kill -HUP `cat /var/run/syslogd.pid` ,
+or
+.Ql systemctl reload syslogd
+on a
+.Xr systemd 1
+host.
 For information on the format of the configuration file,
 see
 .Xr syslog.conf 5 .
@@ -469,9 +484,9 @@ API included with the
 .Nm sysklogd
 project.
 .Pp
-The date and time are taken from the received message.  If the format of
-the timestamp field is incorrect, time obtained from the local host is
-used instead.  This can be overridden by the
+The date and time for a log message are by default read from the
+received message.  If the format of the timestamp field is incorrect,
+the time of reception is used instead.  See also the
 .Fl T
 flag.
 .Sh SECURITY
@@ -546,6 +561,8 @@ perform a re-initialization.  All open files are closed, the
 configuration file (see above) is reread and the
 .Xr syslog 3
 facility is started again.
+Any messages queued in the in-memory per-destination TCP send queue
+are discarded.
 .It TERM
 This tells 
 .Nm
@@ -600,6 +617,7 @@ kernel log device
 .El
 .Sh SEE ALSO
 .Xr logger 1 ,
+.Xr logread 1 ,
 .Xr syslog 3 ,
 .Xr syslogp 3 ,
 .Xr services 5 ,
@@ -609,12 +627,32 @@ kernel log device
 support both RFC3164 and RFC5424, as well as the pre-RFC BSD logging
 support.  It also supports RFC5426, the command line option
 .Fl M Ar length
-can be used to ensure no fragmentation occurs.
+can be used to ensure no fragmentation occurs.  TCP transport is
+supported per RFC6587, using octet counting for framing when sending
+and both octet counting and non-transparent (LF-delimited) framing
+when receiving.  An in-memory per-destination send queue accumulates
+messages during TCP outages and flushes them automatically on
+reconnect; see
+.Xr syslog.conf 5
+for the
+.Ql tcp_suspend_time
+tunable.
+.Pp
+When compiled with OpenSSL support,
+.Nm
+also supports RFC5848 for cryptographically signed syslog messages
+and RFC5425 for TLS-encrypted syslog transport.
+See
+.Xr syslog.conf 5
+for configuration details.
 .Pp
 .Bl -tag -width RFC3164 -compact
 .It Lk https://datatracker.ietf.org/doc/html/rfc3164 RFC3164
 .It Lk https://datatracker.ietf.org/doc/html/rfc5424 RFC5424
+.It Lk https://datatracker.ietf.org/doc/html/rfc5425 RFC5425
 .It Lk https://datatracker.ietf.org/doc/html/rfc5426 RFC5426
+.It Lk https://datatracker.ietf.org/doc/html/rfc5848 RFC5848
+.It Lk https://datatracker.ietf.org/doc/html/rfc6587 RFC6587
 .El
 .Sh HISTORY
 .Nm
@@ -652,9 +690,9 @@ The
 utility first appeared in
 .Bx 4.3 .
 .Sh BUGS
-The ability to log messages received in UDP packets is equivalent to an
-unauthenticated remote disk-filling service, and should probably be
-disabled
+The ability to log messages received in UDP or TCP packets is equivalent
+to an unauthenticated remote disk-filling service, and should probably
+be disabled
 .Fl ( s )
 by default.  (The shipped systemd unit file disables this by default.)
 See also
